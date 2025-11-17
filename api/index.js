@@ -1,29 +1,31 @@
 // /api/index.js
 import express from 'express';
 import { Readable } from 'stream';
+
 const app = express();
+
 const TARGET_API_URL = 'https://generativelanguage.googleapis.com';
+const TARGET_HOSTNAME = new URL(TARGET_API_URL).hostname;
+const TARGET_ORIGIN = new URL(TARGET_API_URL).origin;
 
 app.all('*', async (req, res) => {
-  // 根據請求 URL 決定目標 URL
-  let targetUrl;
-  if (req.url === '/') {
-    targetUrl = 'https://aistudio.google.com/status'; // 根路徑代理到指定 URL
-  } else {
-    targetUrl = `${TARGET_API_URL}${req.url}`; // 其他路徑維持原代理目標
-  }
-
-  // 動態計算目標主機名和來源
-  const targetHostname = new URL(targetUrl).hostname;
-  const targetOrigin = new URL(targetUrl).origin;
-
+  if (req.url === '/') { // (新增對根路徑的判斷)
+    return res.send('proxy is running, you can see more at https://github.com/spectre-pro/gemini-proxy'); // (如果是根路徑，返回指定訊息並結束請求)
+  } 
+  const targetUrl = `${TARGET_API_URL}${req.url}`;
+  
   console.log(`\n==================== 新的代理請求 ====================`);
   console.log(`[${new Date().toISOString()}]`);
   console.log(`代理請求: ${req.method} ${req.url}`);
   console.log(`轉發目標: ${targetUrl}`);
-  
+  console.log(`--- 原始請求標頭 (Raw Request Headers) ---`);
+  // 使用 JSON.stringify(obj, null, 2) 可以讓輸出的物件格式更美觀，方便閱讀
+  console.log(JSON.stringify(req.headers, null, 2));
+  console.log(`------------------------------------------`);
+
   let rawApiKeys = '';
-  let apiKeySource = '';
+  let apiKeySource = ''; // 用來記錄金鑰來源: 'x-goog' 或 'auth'
+
   if (req.headers['x-goog-api-key']) {
     rawApiKeys = req.headers['x-goog-api-key'];
     apiKeySource = 'x-goog';
@@ -34,7 +36,7 @@ app.all('*', async (req, res) => {
     apiKeySource = 'auth';
     console.log('在 Authorization 標頭中找到 API 金鑰');
   }
-  
+
   let selectedKey = '';
   if (apiKeySource) {
     const apiKeys = String(rawApiKeys).split(',').map(k => k.trim()).filter(k => k);
@@ -43,7 +45,7 @@ app.all('*', async (req, res) => {
       console.log(`Gemini Selected API Key: ${selectedKey}`);
     }
   }
-  
+
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
@@ -51,7 +53,8 @@ app.all('*', async (req, res) => {
       headers[key] = value;
     }
   }
-  
+
+  // 根據金鑰來源，將選擇的金鑰以正確的標頭格式加回去
   if (selectedKey) {
     if (apiKeySource === 'x-goog') {
       headers['x-goog-api-key'] = selectedKey;
@@ -59,14 +62,14 @@ app.all('*', async (req, res) => {
       headers['Authorization'] = `Bearer ${selectedKey}`;
     }
   }
-  
-  headers.host = targetHostname;
-  headers.origin = targetOrigin;
-  headers.referer = targetOrigin;
 
+  headers.host = TARGET_HOSTNAME;
+  headers.origin = TARGET_ORIGIN;
+  headers.referer = TARGET_API_URL;
+  
   headers['x-forwarded-for'] = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'] || req.protocol;
-  
+
   const hopByHopHeaders = [
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade'
@@ -74,57 +77,17 @@ app.all('*', async (req, res) => {
   for (const header of hopByHopHeaders) {
     delete headers[header];
   }
-  
+
   try {
     const apiResponse = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
       body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
       duplex: 'half',
-      // 禁用自動重定向，手動處理
-      redirect: 'manual'
     });
-    
-    console.log(`回應狀態碼: ${apiResponse.status}`);
-    console.log(`回應標頭:`, Object.fromEntries(apiResponse.headers.entries()));
-    
-    // 檢查是否為重定向回應
-    if (apiResponse.status >= 300 && apiResponse.status < 400) {
-      const location = apiResponse.headers.get('location');
-      console.log(`檢測到重定向到: ${location}`);
-      
-      if (location) {
-        // 如果是根路徑的重定向，我們可以選擇跟隨或返回重定向
-        if (req.url === '/') {
-          // 選項1: 跟隨重定向
-          console.log(`跟隨重定向到: ${location}`);
-          const redirectResponse = await fetch(location, {
-            method: req.method,
-            headers: headers,
-            body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
-            duplex: 'half'
-          });
-          
-          const responseHeaders = {};
-          for (const [key, value] of redirectResponse.headers.entries()) {
-            if (!['content-encoding', 'transfer-encoding', 'connection', 'strict-transport-security'].includes(key.toLowerCase())) {
-              responseHeaders[key] = value;
-            }
-          }
-          res.writeHead(redirectResponse.status, responseHeaders);
-          
-          if (redirectResponse.body) {
-            Readable.fromWeb(redirectResponse.body).pipe(res);
-          } else {
-            res.end();
-          }
-          return;
-          
-        }
-      }
-    }
-    
-    // 正常處理非重定向回應
+
+    // 將目標 API 的回應頭部轉發給客戶端
+    // 過濾掉不應直接轉發的標頭
     const responseHeaders = {};
     for (const [key, value] of apiResponse.headers.entries()) {
       if (!['content-encoding', 'transfer-encoding', 'connection', 'strict-transport-security'].includes(key.toLowerCase())) {
@@ -132,7 +95,8 @@ app.all('*', async (req, res) => {
       }
     }
     res.writeHead(apiResponse.status, responseHeaders);
-    
+
+    // 將目標 API 的回應流式傳輸回客戶端
     if (apiResponse.body) {
       Readable.fromWeb(apiResponse.body).pipe(res);
     } else {
