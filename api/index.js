@@ -2,19 +2,18 @@
 import express from 'express';
 import { Readable } from 'stream';
 const app = express();
-
 const TARGET_API_URL = 'https://generativelanguage.googleapis.com';
 
 app.all('*', async (req, res) => {
-
+  // 根據請求 URL 決定目標 URL
   let targetUrl;
   if (req.url === '/') {
-    targetUrl = 'https://aistudio.google.com/status';
+    targetUrl = 'https://aistudio.google.com/status'; // 根路徑代理到指定 URL
   } else {
-    targetUrl = `${TARGET_API_URL}${req.url}`;
+    targetUrl = `${TARGET_API_URL}${req.url}`; // 其他路徑維持原代理目標
   }
 
-
+  // 動態計算目標主機名和來源
   const targetHostname = new URL(targetUrl).hostname;
   const targetOrigin = new URL(targetUrl).origin;
 
@@ -22,9 +21,6 @@ app.all('*', async (req, res) => {
   console.log(`[${new Date().toISOString()}]`);
   console.log(`代理請求: ${req.method} ${req.url}`);
   console.log(`轉發目標: ${targetUrl}`);
-  console.log(`--- 原始請求標頭 (Raw Request Headers) ---`);
-  console.log(JSON.stringify(req.headers, null, 2));
-  console.log(`------------------------------------------`);
   
   let rawApiKeys = '';
   let apiKeySource = '';
@@ -85,8 +81,50 @@ app.all('*', async (req, res) => {
       headers: headers,
       body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
       duplex: 'half',
+      // 禁用自動重定向，手動處理
+      redirect: 'manual'
     });
     
+    console.log(`回應狀態碼: ${apiResponse.status}`);
+    console.log(`回應標頭:`, Object.fromEntries(apiResponse.headers.entries()));
+    
+    // 檢查是否為重定向回應
+    if (apiResponse.status >= 300 && apiResponse.status < 400) {
+      const location = apiResponse.headers.get('location');
+      console.log(`檢測到重定向到: ${location}`);
+      
+      if (location) {
+        // 如果是根路徑的重定向，我們可以選擇跟隨或返回重定向
+        if (req.url === '/') {
+          // 選項1: 跟隨重定向
+          console.log(`跟隨重定向到: ${location}`);
+          const redirectResponse = await fetch(location, {
+            method: req.method,
+            headers: headers,
+            body: (req.method !== 'GET' && req.method !== 'HEAD') ? req : undefined,
+            duplex: 'half'
+          });
+          
+          const responseHeaders = {};
+          for (const [key, value] of redirectResponse.headers.entries()) {
+            if (!['content-encoding', 'transfer-encoding', 'connection', 'strict-transport-security'].includes(key.toLowerCase())) {
+              responseHeaders[key] = value;
+            }
+          }
+          res.writeHead(redirectResponse.status, responseHeaders);
+          
+          if (redirectResponse.body) {
+            Readable.fromWeb(redirectResponse.body).pipe(res);
+          } else {
+            res.end();
+          }
+          return;
+          
+        }
+      }
+    }
+    
+    // 正常處理非重定向回應
     const responseHeaders = {};
     for (const [key, value] of apiResponse.headers.entries()) {
       if (!['content-encoding', 'transfer-encoding', 'connection', 'strict-transport-security'].includes(key.toLowerCase())) {
